@@ -12,6 +12,7 @@ enum class CameraModel { kPinhole, kFisheye };
 struct CalibrationResult {
   cv::Mat camera_matrix;
   cv::Mat dist_coeffs;
+  // 标定后的均方根重投影误差（Root Mean Square reprojection error）
   double rms = 0.0;
   double mean_reprojection_error = 0.0;
   cv::Size image_size = {};

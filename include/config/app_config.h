@@ -13,6 +13,8 @@ namespace config {
 struct CameraConfig {
   std::string name = "camera";
   int device = 0;
+  std::string input_path;
+  std::string input_type = "auto";
   cv::Size board_size = {9, 6};
   float square_size = 25.0f;
   std::string model = "pinhole";

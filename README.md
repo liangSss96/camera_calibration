@@ -8,7 +8,6 @@
 2. 生成并编译：
 
 ```
-cmake -S . -B build
 cmake --build build --config Release
 ```
 
@@ -17,6 +16,17 @@ cmake --build build --config Release
 ```
 build\Release\camera_calibration.exe --device 0 --cols 9 --rows 6 --square 25 --model pinhole --output calibration.yaml
 ```
+
+离线输入（视频或图像文件夹）：
+
+```
+build\Release\camera_calibration.exe --input "D:\data\calib.mp4" --model pinhole --output calibration.yaml
+build\Release\camera_calibration.exe --images "D:\data\images" --model fisheye --output fisheye.yaml
+```
+
+视频解码说明（H264/H265 等）：
+- 是否能打开视频文件取决于 OpenCV 编译的后端（FFmpeg/GStreamer）。
+- Windows 上建议使用带 FFmpeg 的 OpenCV 预编译包，才能直接读取 H264 的 `mp4`/`avi`。
 
 配置文件模式：
 
@@ -27,6 +37,9 @@ build\Release\camera_calibration.exe --config config.yaml
 常用参数：
 - `--config`：YAML 配置文件
 - `--device`：摄像头索引
+- `--input`：视频文件或图像文件夹
+- `--images`：图像文件夹（强制图片序列）
+- `--input-type`：`auto` / `video` / `images`
 - `--cols` / `--rows`：棋盘格内角点数量（默认 9x6）
 - `--square`：格长（mm）
 - `--model`：`pinhole` 或 `fisheye`
@@ -51,6 +64,8 @@ app:
 cameras:
   - name: "cam0"
     device: 0
+    input_path: ""
+    input_type: "auto"
     model: "pinhole"
     board_cols: 9
     board_rows: 6
@@ -120,3 +135,5 @@ YAML 中包含：
 - 会话统计与覆盖度统计
 - 采样配置与拒绝原因统计
 - 内参与畸变参数矩阵
+
+离线输入模式下，所有通过质量筛选的帧会保存到 `outputs/samples/`，用于复查与复用。

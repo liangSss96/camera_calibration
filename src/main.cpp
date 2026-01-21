@@ -2,9 +2,13 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -18,6 +22,8 @@ namespace {
 struct Options {
   std::string config_path;
   int device = 0;
+  std::string input_path;
+  std::string input_type = "auto";
   cv::Size board_size = {9, 6};
   float square_size = 25.0f;
   std::string model = "pinhole";
@@ -34,6 +40,9 @@ void PrintUsage() {
             << "Options:\n"
             << "  --config <path>       YAML config file\n"
             << "  --device <index>      Camera index (default: 0)\n"
+            << "  --input <path>        Video file or image folder\n"
+            << "  --images <folder>     Image folder input\n"
+            << "  --input-type <auto|video|images>\n"
             << "  --cols <int>          Board corners in columns (default: 9)\n"
             << "  --rows <int>          Board corners in rows (default: 6)\n"
             << "  --square <float>      Square size in mm (default: 25)\n"
@@ -65,6 +74,22 @@ Options ParseArgs(int argc, char** argv) {
     } else if (arg == "--device") {
       std::string value;
       if (next(&value)) opt.device = std::stoi(value);
+      else opt.invalid_args = true;
+    } else if (arg == "--input") {
+      std::string value;
+      if (next(&value)) opt.input_path = value;
+      else opt.invalid_args = true;
+    } else if (arg == "--images") {
+      std::string value;
+      if (next(&value)) {
+        opt.input_path = value;
+        opt.input_type = "images";
+      } else {
+        opt.invalid_args = true;
+      }
+    } else if (arg == "--input-type") {
+      std::string value;
+      if (next(&value)) opt.input_type = value;
       else opt.invalid_args = true;
     } else if (arg == "--cols") {
       std::string value;
@@ -112,6 +137,76 @@ double MeanCornerShift(const std::vector<cv::Point2f>& before,
     sum += cv::norm(before[i] - after[i]);
   }
   return sum / static_cast<double>(before.size());
+}
+
+std::string ToLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+// 收集指定文件夹下所有支持格式的图像文件路径，并按名称排序
+//
+// 参数：
+//   folder - 需要遍历的文件夹路径
+// 返回：
+//   包含所有支持类型图片路径的字符串向量（按名称升序排序）
+std::vector<std::string> CollectImagePaths(const std::string& folder) {
+  // 用于存储收集到的图像路径
+  std::vector<std::string> paths;
+  // 用于捕获文件系统操作可能发生的错误
+  std::error_code ec;
+
+  // 判断输入路径是否为一个有效的文件夹，不是则直接返回空列表
+  if (!std::filesystem::is_directory(folder, ec)) {
+    return paths;
+  }
+
+  // 遍历文件夹内的所有目录项（文件/文件夹等）
+  for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+    // 只处理常规文件（跳过目录、符号链接等）
+    if (!entry.is_regular_file()) continue;
+
+    // 获取文件扩展名并转为小写形式，兼容各种写法
+    std::string ext = ToLower(entry.path().extension().string());
+
+    // 判断扩展名是否属于常见的图片格式
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" ||
+        ext == ".tiff" || ext == ".tif") {
+      // 将符合条件的文件路径添加到结果列表
+      paths.push_back(entry.path().string());
+    }
+  }
+
+  // 对收集到的路径按字符串顺序排序，保证读取一致性
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
+std::string MakeSampleName(int index) {
+  std::ostringstream oss;
+  oss << "sample_" << std::setw(4) << std::setfill('0') << index << ".png";
+  return oss.str();
+}
+
+enum class InputMode {
+  kCamera, // 摄像头输入
+  kVideo,  // 视频文件输入
+  kImages  // 图像文件夹输入
+};
+
+InputMode ResolveInputMode(const config::CameraConfig& cam_cfg) {
+  if (cam_cfg.input_path.empty()) {
+    return InputMode::kCamera;
+  }
+  std::string type = ToLower(cam_cfg.input_type);
+  if (type == "images") return InputMode::kImages;
+  if (type == "video") return InputMode::kVideo;
+  std::error_code ec;
+  if (std::filesystem::is_directory(cam_cfg.input_path, ec)) {
+    return InputMode::kImages;
+  }
+  return InputMode::kVideo;
 }
 
 
@@ -187,6 +282,8 @@ int main(int argc, char** argv) {
       return 1;
     }
     cam_cfg.device = opt.device;
+    cam_cfg.input_path = opt.input_path;
+    cam_cfg.input_type = opt.input_type;
     cam_cfg.board_size = opt.board_size;
     cam_cfg.square_size = opt.square_size;
     cam_cfg.model = opt.model;
@@ -201,12 +298,43 @@ int main(int argc, char** argv) {
   if (!app_cfg.report_dir.empty()) {
     std::filesystem::create_directories(app_cfg.report_dir);
   }
+  const std::string output_base =
+      app_cfg.output_dir.empty() ? std::string("outputs") : app_cfg.output_dir;
+  const std::string sample_dir = output_base + "/samples";
+  std::filesystem::create_directories(sample_dir);
 
-  // 打开相机设备并进行基本检查。
-  cv::VideoCapture cap(cam_cfg.device);
-  if (!cap.isOpened()) {
-    std::cerr << "Failed to open camera device." << std::endl;
-    return 1;
+  // 选择输入源：相机、视频文件或图像序列。
+  InputMode input_mode = ResolveInputMode(cam_cfg);
+  cv::VideoCapture cap;
+  std::vector<std::string> image_paths;
+  int wait_delay_ms = 1;
+  if (input_mode == InputMode::kImages) {
+    image_paths = CollectImagePaths(cam_cfg.input_path);
+    if (image_paths.empty()) {
+      std::cerr << "No images found in: " << cam_cfg.input_path << std::endl;
+      return 1;
+    }
+    std::cout << "Loaded " << image_paths.size() << " images from "
+              << cam_cfg.input_path << std::endl;
+  } else {
+    if (input_mode == InputMode::kVideo) {
+      cap.open(cam_cfg.input_path);
+    } else {
+      cap.open(cam_cfg.device);
+    }
+    if (!cap.isOpened()) {
+      std::cerr << "Failed to open input source. If the video is H264/H265,"
+                   " make sure OpenCV is built with FFmpeg or GStreamer."
+                << std::endl;
+      return 1;
+    }
+    if (input_mode == InputMode::kVideo) {
+      const double fps = cap.get(cv::CAP_PROP_FPS);
+      if (fps > 1.0 && fps < 240.0) {
+        wait_delay_ms = static_cast<int>(1000.0 / fps + 0.5);
+      }
+    }
+    std::cout << "Video backend: " << cap.getBackendName() << std::endl;
   }
 
   // 采样器：根据质量指标决定是否收集该帧。
@@ -223,10 +351,27 @@ int main(int argc, char** argv) {
             << std::endl;
 
   bool calibrated = false;
+  size_t image_index = 0;
+  int saved_samples = 0;
   while (true) {
     cv::Mat frame;
-    cap >> frame;
-    if (frame.empty()) continue;
+    if (input_mode == InputMode::kImages) {
+      if (image_index >= image_paths.size()) {
+        break;
+      }
+      frame = cv::imread(image_paths[image_index++], cv::IMREAD_COLOR);
+      if (frame.empty()) {
+        continue;
+      }
+    } else {
+      cap >> frame;
+      if (frame.empty()) {
+        if (input_mode == InputMode::kCamera) {
+          continue;
+        }
+        break;
+      }
+    }
     stats.total_frames++;
 
     // 超时/帧数限制：用于避免长时间阻塞。
@@ -268,6 +413,9 @@ int main(int argc, char** argv) {
         stats.accepted_frames++;
         calibrator.addSample(corners, board_size, cam_cfg.square_size,
                              frame.size());
+        const std::string sample_path =
+            sample_dir + "/" + MakeSampleName(++saved_samples);
+        cv::imwrite(sample_path, frame);
       }
       cv::drawChessboardCorners(frame, board_size, corners, found);
     } else {
@@ -296,36 +444,39 @@ int main(int argc, char** argv) {
       calibrated = true;
     }
 
-    cv::imshow("camera calibration", frame);
-    int key = cv::waitKey(1);
-    if (key == 'q' || key == 27) {
-      break;
-    }
-    if (key == 'r') {
-      // 重置所有采样，重新开始收集。
-      selector.reset();
-      calibrator.reset();
-      stats = report::SessionStats{};
-      calibrated = false;
-      std::cout << "Reset samples." << std::endl;
-    }
-    if (key == 's' && sufficient) {
-      // 手动触发保存，适用于 manual 模式。
-      calibration::CalibrationResult result;
-      if (cam_cfg.model == "fisheye") {
-        result = calibrator.calibrateFisheye();
-      } else {
-        result = calibrator.calibratePinhole();
+    if (app_cfg.show_window) {
+      cv::imshow("camera calibration", frame);
+      int key = cv::waitKey(wait_delay_ms);
+      if (key == 'q' || key == 27) {
+        break;
       }
-      if (calibrator.saveYaml(cam_cfg.output, result)) {
-        std::cout << "Calibration saved: " << cam_cfg.output << std::endl;
-        std::cout << "RMS: " << result.rms
-                  << " Mean reprojection error: "
-                  << result.mean_reprojection_error << std::endl;
-        report::WriteMarkdownReport(cam_cfg.report, result, selector, stats,
-                                    cam_cfg.name);
+      if (key == 'r') {
+        // 重置所有采样，重新开始收集。
+        selector.reset();
+        calibrator.reset();
+        stats = report::SessionStats{};
+        calibrated = false;
+        saved_samples = 0;
+        std::cout << "Reset samples." << std::endl;
       }
-      calibrated = true;
+      if (key == 's' && sufficient) {
+        // 手动触发保存，适用于 manual 模式。
+        calibration::CalibrationResult result;
+        if (cam_cfg.model == "fisheye") {
+          result = calibrator.calibrateFisheye();
+        } else {
+          result = calibrator.calibratePinhole();
+        }
+        if (calibrator.saveYaml(cam_cfg.output, result)) {
+          std::cout << "Calibration saved: " << cam_cfg.output << std::endl;
+          std::cout << "RMS: " << result.rms
+                    << " Mean reprojection error: "
+                    << result.mean_reprojection_error << std::endl;
+          report::WriteMarkdownReport(cam_cfg.report, result, selector, stats,
+                                      cam_cfg.name);
+        }
+        calibrated = true;
+      }
     }
   }
 

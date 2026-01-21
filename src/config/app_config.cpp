@@ -78,6 +78,8 @@ CameraConfig ReadCameraConfig(const cv::FileNode& node,
   CameraConfig cam;
   cam.name = GetString(node, "name", cam.name);
   cam.device = GetInt(node, "device", cam.device);
+  cam.input_path = GetString(node, "input_path", cam.input_path);
+  cam.input_type = GetString(node, "input_type", cam.input_type);
   cam.board_size.width = GetInt(node, "board_cols", cam.board_size.width);
   cam.board_size.height = GetInt(node, "board_rows", cam.board_size.height);
   cam.square_size =
